@@ -1,0 +1,87 @@
+name: Arctiq Mission Pipeline
+on:
+  workflow_dispatch:
+    #branches:
+      #- main
+jobs:
+  sonar:
+    name: code quality analysis
+    runs-on: [Linux]
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+      - uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      # If you wish to fail your job when the Quality Gate is red, uncomment the
+      # following lines. This would typically be used to fail a deployment.
+      - uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          
+      - name: npm install dependencies
+        run: npm install
+
+      - name: Trivy file scan
+        run: trivy fs . > trivyfs.txt
+
+  docker-push:
+    runs-on: [Linux]
+    needs: [sonar]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Build and push
+        run: |
+          docker build -t arctiqgame .
+          docker tag arctiqgame jndamito/joshrepo:arctiqgame
+          docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+          docker push jndamito/joshrepo:arctiqgame
+        env: 
+          DOCKER_CLI_ACI: 1
+          
+  Image-scan:
+    runs-on: [Linux]
+    needs: [docker-push]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Image scan
+        run: |
+          docker login -u ${{ secrets.DOCKERHUB_USERNAME }} -p ${{ secrets.DOCKERHUB_TOKEN }}
+          trivy image jndamito/joshrepo:arctiqgame > trivyimage.txt
+      - name: Check Trivy scan result
+        run: |
+          SCAN_RESULT=$(trivy image jndamito/joshrepo:arctiqgame)
+          TRIVY_EXIT_CODE=$?
+          if [ $TRIVY_EXIT_CODE -eq 0 ]; then
+          echo "Trivy scan completed successfully."
+          else
+            if echo "$SCAN_RESULT" | grep -iqE 'CRITICAL|HIGH'; then
+            echo "Trivy scan failed with critical or high vulnerabilities."
+            exit 1
+            else
+            echo "Trivy scan passed with medium, low, or unknown vulnerabilities."
+            fi
+          fi
+  deploy:
+   needs: [sonar, docker-push, Image-scan]   
+   runs-on: [Linux]
+   steps:
+      - name: docker pull image
+        run: docker pull jndamito/joshrepo:arctiq
+
+      - name: Image scan
+        run: trivy image jndamito/joshrepo:arctiqgame > trivyimagedeploy.txt  
+  
+      #- name: Deploy to container
+        #run: docker run -d --name game -p 3000:3000 jndamito/joshrepo:arctiqgame
+
+      - name: Update kubeconfig
+        run: aws eks --region us-east-1 update-kubeconfig --name EKS_CLOUD
+
+      - name: Deploy to kubernetes
+        run: kubectl apply -f deployment.yml
