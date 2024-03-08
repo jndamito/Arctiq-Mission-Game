@@ -28,9 +28,47 @@ jobs:
       - name: Trivy file scan
         run: trivy fs . > trivyfs.txt
 
+  publish-build:
+     runs-on: [Linux]
+     needs: [sonar]
+       
+     steps:
+       - name: Checkout
+         uses: actions/checkout@v3
+         
+       - name: Setup JFrog CLI
+         uses: jfrog/setup-jfrog-cli@v3
+         env:  
+           JF_URL: ${{ secrets.JF_URL }}
+           JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+           
+       - name: Setup Node npm
+         uses: actions/setup-node@v3
+           
+       - name: Set CLI Config
+         run: jf npm-config --global=true --repo-resolve=arctiq-npm --repo-deploy=arctiq-npm
+           
+       - name: Install Deps
+         run: jf npm install
+           
+       #- name: Run tests
+         #run: npm test
+         
+       - name: Publish
+         run: jf npm publish
+         
+       - name: Publish Build info With JFrog CLI
+         run: |
+          # Collect environment variables for the build
+          jf rt build-collect-env
+          # Collect VCS details from git and add them to the build
+          jf rt build-add-git
+          # Publish build info
+          jf rt build-publish
+
   docker-push:
     runs-on: [Linux]
-    needs: [sonar]
+    needs: [sonar, publish-build]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -67,6 +105,7 @@ jobs:
             echo "Trivy scan passed with medium, low, or unknown vulnerabilities."
             fi
           fi
+
   deploy:
    needs: [sonar, docker-push, Image-scan]   
    runs-on: [Linux]
@@ -85,3 +124,6 @@ jobs:
 
       - name: Deploy to kubernetes
         run: kubectl apply -f deployment.yml
+
+      - name: Echo Load Balancer
+        run: kubectl get svc | grep amazon | awk '{print $4}' | cat
