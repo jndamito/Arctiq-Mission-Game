@@ -39,9 +39,6 @@ jobs:
         make build
         sudo mv gitleaks /usr/local/bin/gitleaks
 
-    # - name: Install TruffleHog
-    #   run: pip install truffleHog
-
     - name: Install jq
       run: sudo apt-get install -y jq
 
@@ -54,24 +51,6 @@ jobs:
       run: gitleaks detect --source . --report-format json --report-path gitleaks_report.json --verbose
       continue-on-error: true
 
-    # - name: Run TruffleHog scan
-    #   run: trufflehog --json . > trufflehog_report.json
-    #   continue-on-error: true
-
-    # - name: Ensure TruffleHog report format
-    #   run: |
-    #     if ! jq -e . trufflehog_report.json > /dev/null 2>&1; then
-    #       echo '[]' > trufflehog_report.json
-    #     fi
-    #     jq '{findings: .}' trufflehog_report.json > trufflehog_converted_report.json
-    #     cat ./trufflehog_converted_report.json
-
-    # - name: Combine Reports with jq
-    #   run: |
-    #     jq -e . gitleaks_report.json || echo '{"findings":[]}' > gitleaks_report.json
-    #     jq -e . trufflehog_converted_report.json || echo '{"findings":[]}' > trufflehog_converted_report.json
-    #     jq -s '.[0].findings + .[1]' gitleaks_report.json trufflehog_converted_report.json | jq '{findings: .}' > sensitive_data_report.json
-    
     - name: Analyze Gitleaks report and prepare replacements
       run: |
         python3 - <<'EOF'
@@ -89,6 +68,10 @@ jobs:
                         placeholder = '[SENSITIVE_DATA_AWS_KEY]'
                     elif 'API' in match:
                         placeholder = '[SENSITIVE_DATA_API_KEY]'
+                    elif 'ACCESS KEY' in match:
+                        placeholder = '[SENSITIVE_DATA_ACCESS_KEY]'
+                    elif 'SECRET' in match:
+                        placeholder = '[SENSITIVE_DATA_SECRET_KEY]'
                     elif 'Azure' in match:
                         placeholder = '[SENSITIVE_DATA_AZURE_KEY]'
                     else:
@@ -114,118 +97,3 @@ jobs:
       with:
         name: gitleaks-report
         path: gitleaks_report.json
-        
-        
-  Replace-secrets-with-placeholders:
-    needs: scan-commits-and-clean-hitory
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0 
-        
-    - name: Set up SSH
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan github.com >> ~/.ssh/known_hosts
-        git config --global user.email "josiasndam22@gmail.com"
-        git config --global user.name "jndamito"
-
-    - name: Set up Java
-      uses: actions/setup-java@v2
-      with:
-        distribution: 'adopt'
-        java-version: '11'
-        
-    - name: Install BFG Repo-Cleaner
-      run: wget https://repo1.maven.org/maven2/com/madgag/bfg/1.14.0/bfg-1.14.0.jar -O bfg.jar
-
-    - name: Install Gitleaks
-      run: |
-        git clone https://github.com/gitleaks/gitleaks.git
-        cd gitleaks
-        make build
-        sudo mv gitleaks /usr/local/bin/gitleaks
-
-    - name: Install jq
-      run: sudo apt-get install -y jq
-
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.x'
-
-    - name: Run Gitleaks scan
-      run: gitleaks detect --source . --report-format json --report-path gitleaks_report.json --verbose
-      continue-on-error: true
-
-    - name: Replace secrets in files
-      run: |
-        python3 - <<'EOF'
-        import json
-        import os
-
-        def replace_secrets(input_file):
-            with open(input_file, 'r') as infile:
-                data = json.load(infile)
-
-            replacements = {}
-            for finding in data:
-                secret = finding.get('Secret')
-                if secret:
-                    if 'AWS' in secret:
-                        placeholder = '[SENSITIVE_DATA_AWS_KEY]'
-                    elif 'API' in secret:
-                        placeholder = '[SENSITIVE_DATA_API_KEY]'
-                    elif 'Azure' in secret:
-                        placeholder = '[SENSITIVE_DATA_AZURE_KEY]'
-                    else:
-                        placeholder = '[SENSITIVE_DATA]'
-                    replacements[secret] = placeholder
-
-            modified_files = set()
-            for root, _, files in os.walk('.'):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        new_content = content
-                        for secret, placeholder in replacements.items():
-                            new_content = new_content.replace(secret, placeholder)
-                        if new_content != content:
-                            with open(file_path, 'w', encoding='utf-8') as f:
-                                f.write(new_content)
-                            modified_files.add(file_path)
-                    except UnicodeDecodeError:
-                        print(f"Skipping file due to encoding error: {file_path}")
-
-            with open('modified_files.txt', 'w') as f:
-                for file_path in modified_files:
-                    f.write(file_path + '\n')
-
-        replace_secrets('gitleaks_report.json')
-        EOF
-
-    - name: Commit changes
-      run: |
-        if [ -s modified_files.txt ]; then
-          cat modified_files.txt | xargs git add
-          git commit -m "Replace secrets with placeholders"
-        fi
-
-    - name: Replace sensitive data with BFG Repo-Cleaner
-      run: java -jar bfg.jar --replace-text replacements.txt
-
-    - name: Cleanup and force push
-      run: |
-        git remote set-url origin git@github.com:jndamito/appsecdemo.git
-        git reflog expire --expire=now --all
-        git gc --prune=now --aggressive
-        git push --force
-
-
