@@ -1,0 +1,148 @@
+name: Scan and Clean Sensitive Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan-and-clean:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0 # Fetch all history for all branches and tags
+
+    - name: Set up Java
+      uses: actions/setup-java@v2
+      with:
+        distribution: 'adopt'
+        java-version: '11'
+        
+    - name: Set up SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+
+    - name: Install BFG Repo-Cleaner
+      run: wget https://repo1.maven.org/maven2/com/madgag/bfg/1.14.0/bfg-1.14.0.jar -O bfg.jar
+
+    - name: Install Gitleaks
+      run: |
+        git clone https://github.com/gitleaks/gitleaks.git
+        cd gitleaks
+        make build
+        sudo mv gitleaks /usr/local/bin/gitleaks
+
+    # - name: Install TruffleHog
+    #   run: pip install truffleHog
+
+    - name: Install jq
+      run: sudo apt-get install -y jq
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.x'
+
+    - name: Run Gitleaks scan
+      run: gitleaks detect --source . --report-format json --report-path gitleaks_report.json --verbose
+      continue-on-error: true
+
+    # - name: Run TruffleHog scan
+    #   run: trufflehog --json . > trufflehog_report.json
+    #   continue-on-error: true
+
+    # - name: Ensure TruffleHog report format
+    #   run: |
+    #     if ! jq -e . trufflehog_report.json > /dev/null 2>&1; then
+    #       echo '[]' > trufflehog_report.json
+    #     fi
+    #     jq '{findings: .}' trufflehog_report.json > trufflehog_converted_report.json
+    #     cat ./trufflehog_converted_report.json
+
+    # - name: Combine Reports with jq
+    #   run: |
+    #     jq -e . gitleaks_report.json || echo '{"findings":[]}' > gitleaks_report.json
+    #     jq -e . trufflehog_converted_report.json || echo '{"findings":[]}' > trufflehog_converted_report.json
+    #     jq -s '.[0].findings + .[1]' gitleaks_report.json trufflehog_converted_report.json | jq '{findings: .}' > sensitive_data_report.json
+    
+    - name: Analyze Gitleaks report and prepare replacements
+      run: |
+        python3 - <<'EOF'
+        import json
+
+        def analyze_report(input_file, output_file):
+            with open(input_file, 'r') as infile:
+                data = json.load(infile)
+
+            replacements = []
+            for finding in data:
+                match = finding.get('Secret')
+                if match:
+                    if 'AWS' in match:
+                        placeholder = '[SENSITIVE_DATA_AWS_KEY]'
+                    elif 'API' in match:
+                        placeholder = '[SENSITIVE_DATA_API_KEY]'
+                    elif 'Azure' in match:
+                        placeholder = '[SENSITIVE_DATA_AZURE_KEY]'
+                    else:
+                        placeholder = '[SENSITIVE_DATA]'
+                    replacements.append(f"{match}==>{placeholder}")
+
+            with open(output_file, 'w') as outfile:
+                outfile.write("\n".join(replacements))
+
+        analyze_report('gitleaks_report.json', 'replacements.txt')
+        EOF
+
+    - name: Replace sensitive data with BFG Repo-Cleaner
+      run: java -jar bfg.jar --replace-text replacements.txt
+
+    - name: Cleanup and force push
+      run: |
+        git reflog expire --expire=now --all && git gc --prune=now --aggressive
+        git push --force
+
+    # - name: Generate summary report
+    #   run: |
+    #     python3 - <<'EOF'
+    #     import json
+
+    #     def generate_summary(input_file, output_file):
+    #         with open(input_file, 'r') as infile:
+    #             data = json.load(infile)
+
+    #         summary = {
+    #             "total_replacements": 0,
+    #             "types_of_sensitive_data": {},
+    #             "commits_modified": 0,
+    #             "authors": set()
+    #         }
+
+    #         for finding in data:
+    #             summary['commits_modified'] += 1
+    #             author = finding.get('Commit', {}).get('Author', {}).get('Email', 'Unknown')
+    #             summary['authors'].add(author)
+    #             rule = finding.get('RuleID')
+    #             summary['total_replacements'] += 1
+    #             if rule not in summary['types_of_sensitive_data']:
+    #                 summary['types_of_sensitive_data'][rule] = 0
+    #             summary['types_of_sensitive_data'][rule] += 1
+
+    #         summary['authors'] = list(summary['authors'])
+
+    #         with open(output_file, 'w') as outfile:
+    #             json.dump(summary, outfile, indent=4)
+
+    #     generate_summary('gitleaks_report.json', 'summary_report.json')
+    #     EOF
+
+    - name: Upload Gitleaks report
+      uses: actions/upload-artifact@v2
+      with:
+        name: gitleaks-report
+        path: gitleaks_report.json
