@@ -102,6 +102,59 @@ jobs:
     - name: Replace sensitive data with BFG Repo-Cleaner
       run: java -jar bfg.jar --replace-text replacements.txt
 
+    - name: Replace secrets in files
+      run: |
+        python3 - <<'EOF'
+        import json
+        import os
+
+        def replace_secrets(input_file):
+            with open(input_file, 'r') as infile:
+                data = json.load(infile)
+
+            replacements = {}
+            for finding in data:
+                secret = finding.get('Secret')
+                if secret:
+                    if 'AWS' in secret:
+                        placeholder = '[SENSITIVE_DATA_AWS_KEY]'
+                    elif 'API' in secret:
+                        placeholder = '[SENSITIVE_DATA_API_KEY]'
+                    elif 'Azure' in secret:
+                        placeholder = '[SENSITIVE_DATA_AZURE_KEY]'
+                    else:
+                        placeholder = '[SENSITIVE_DATA]'
+                    replacements[secret] = placeholder
+
+            modified_files = set()
+            for root, _, files in os.walk('.'):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        new_content = content
+                        for secret, placeholder in replacements.items():
+                            new_content = new_content.replace(secret, placeholder)
+                        if new_content != content:
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                f.write(new_content)
+                            modified_files.add(file_path)
+                    except UnicodeDecodeError:
+                        print(f"Skipping file due to encoding error: {file_path}")
+
+            with open('modified_files.txt', 'w') as f:
+                f.write('\n'.join(modified_files))
+
+        replace_secrets('gitleaks_report.json')
+        EOF
+
+    - name: Commit changes
+      run: |
+        cat modified_files.txt | xargs git add
+        git commit -m "Replace secrets with placeholders"
+      continue-on-error: true
+
     - name: Cleanup and force push
       run: |
         git reflog expire --expire=now --all && git gc --prune=now --aggressive
